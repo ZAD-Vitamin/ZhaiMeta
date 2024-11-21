@@ -1,0 +1,355 @@
+火山图绘制
+# 加载必要库
+library(ggplot2)
+library(ggrepel)
+
+# 读取数据
+gene <- read.delim('GSE40290_Volcano_data.txt', sep = '\t', stringsAsFactors = FALSE)
+
+# 处理 NA 值
+gene <- gene[!is.na(gene$logFC) & !is.na(gene$adj.P.Val), ]
+
+# 标记差异类型
+gene$sig <- ifelse(gene$adj.P.Val < 0.05 & gene$logFC <= -1, 'NX',
+                   ifelse(gene$adj.P.Val < 0.05 & gene$logFC >= 1, 'DLY', 'None'))
+
+# 找出前 20 个上调/下调显著基因
+up <- subset(gene, sig == 'NX') %>% arrange(adj.P.Val) %>% head(20)
+down <- subset(gene, sig == 'DLY') %>% arrange(adj.P.Val) %>% head(20)
+
+# 绘制火山图
+p <- ggplot(gene, aes(x = logFC, y = -log10(adj.P.Val), color = sig)) +
+  geom_point(alpha = 1, size = 2) +
+  scale_colour_manual(values = c('#E63946', '#224FB8', 'gray'), 
+                      limits = c('DLY', 'NX', 'None')) +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(color = 'black', fill = 'transparent'), 
+        plot.title = element_text(hjust = 0.5)) +
+  theme(legend.key = element_rect(fill = 'transparent'), 
+        legend.background = element_rect(fill = 'transparent'), 
+        legend.position = c(0.9, 0.93)) +
+  geom_vline(xintercept = c(-1, 1), color = 'gray', size = 0.3) +
+  geom_hline(yintercept = -log(0.05, 10), color = 'gray', size = 0.3) +
+  labs(x = '\nLog2 FC', y = '-Log10 FDR\n', color = '', title = 'DLY vs NX\n')
+
+# 标注基因
+p1 <- p + theme(legend.position = 'right') +
+  geom_text_repel(data = rbind(up, down), 
+                  aes(x = logFC, y = -log10(adj.P.Val), label = gene_name),
+                  size = 3, box.padding = unit(0.5, 'lines'), 
+                  segment.color = 'black', max.overlaps = Inf, 
+                  show.legend = FALSE)
+
+# 保存图像
+ggsave('gene1.png', p1, width = 6, height = 6, bg = "transparent")
+
+# 显示图像
+p1
+
+随机森林回归
+##数据预处???
+#读取 OTUs 丰度???
+otu <- read.delim('otu_table.txt', row.names = 1)
+
+#过滤低丰??? OTUs 类群，它们对分类贡献度低，且影响计算效率
+#例如剔除总丰度低??? 0.05% 的???
+otu <- otu[which(rowSums(otu) >= 100), ]
+
+#合并有关于背膘厚的信息
+plant <- read.delim('plant_age.txt', row.names = 1)
+
+otu <- data.frame(t(otu))
+otu <- otu[rownames(plant), ]
+otu <- cbind(otu, plant)
+
+#为了方便后续评估随机森林模型的性能
+#将总数据集分为训练集（??? 70%）和测试集（??? 30%???
+set.seed(123)
+train <- sample(nrow(otu), nrow(otu)*0.7)
+otu_train <- otu[train, ]
+otu_test <- otu[-train, ]
+
+##randomForest 包的随机森林
+library(randomForest)
+
+#随机森林计算（默认生??? 500 棵决策树），详情 ?randomForest
+set.seed(123)
+otu_train.forest <- randomForest(plant_age~., data = otu_train, importance = TRUE)
+otu_train.forest
+
+#使用训练集，查看预测精度
+plant_predict <- predict(otu_train.forest, otu_train)
+
+plot(otu_train$plant_age, plant_predict, main = '训练???', 
+    xlab = 'Plant age (days)', ylab = 'Predict')
+abline(1, 1)
+
+#使用测试集，评估预测性能
+plant_predict <- predict(otu_train.forest, otu_test)
+
+plot(otu_test$plant_age, plant_predict, main = '测试???',
+    xlab = 'Plant age (days)', ylab = 'Predict')
+abline(1, 1)
+
+##OTU 的重要性评???
+#查看表示每个预测变量（细??? OTU）重要性的得分
+#summary(otu_train.forest)
+importance_otu <- otu_train.forest$importance
+head(importance_otu)
+
+#或者使用函??? importance()
+importance_otu <- data.frame(importance(otu_train.forest), check.names = FALSE)
+head(importance_otu)
+
+#作图展示 top30 重要??? OTUs
+varImpPlot(otu_train.forest, n.var = min(30, nrow(otu_train.forest$importance)), 
+    main = 'Top 30 - variable importance')
+
+#可以根据某种重要性的高低排个序，例如根据“IncNodePurity”指???
+importance_otu <- importance_otu[order(importance_otu$IncNodePurity, decreasing = TRUE), ]
+head(importance_otu)
+
+#输出表格
+#write.table(importance_otu, 'importance_otu.txt', sep = '\t', col.names = NA, quote = FALSE)
+
+##交叉验证辅助评估选择特定数量??? OTU
+#5 次重复十折交叉验???
+set.seed(123)
+otu_train.cv <- replicate(5, rfcv(otu_train[-ncol(otu_train)], otu_train$plant_age, cv.fold = 10, step = 1.5), simplify = FALSE)
+otu_train.cv
+
+#提取验证结果绘图
+otu_train.cv <- data.frame(sapply(otu_train.cv, '[[', 'error.cv'))
+otu_train.cv$otus <- rownames(otu_train.cv)
+otu_train.cv <- reshape2::melt(otu_train.cv, id = 'otus')
+otu_train.cv$otus <- as.numeric(as.character(otu_train.cv$otus))
+
+otu_train.cv.mean <- aggregate(otu_train.cv$value, by = list(otu_train.cv$otus), FUN = mean)
+head(otu_train.cv.mean, 20)
+
+#拟合线图
+library(ggplot2)
+
+ggplot(otu_train.cv.mean, aes(Group.1, x)) +
+geom_line() +
+theme(panel.grid = element_blank(), panel.background = element_rect(color = 'black', fill = 'transparent')) +  
+labs(title = '',x = 'Number of OTUs', y = 'Cross-validation error')
+
+#提示保留 9-13 个重要的 OTU，可以使随机森林回归的精度最大化
+#首先根据某种重要性的高低排个序，例如根据“IncNodePurity”指???
+importance_otu <- importance_otu[order(importance_otu$`%IncMSE`, decreasing = TRUE), ]
+
+#然后取出排名靠前??? OTU，例??? top10 最重要??? OTU
+importance_otu.select <- importance_otu[1:25, ]
+importance_otu.select
+
+#输出表格
+#write.table(importance_otu.select, 'importance_otu.select.txt', sep = '\t', col.names = NA, quote = FALSE)
+
+#不妨简单查看下这些重要??? OTU 丰度与植物生长时间的关系
+#可以看到趋势非常明显，包括根际富集或排斥等都有涉???
+otu_id.select <- rownames(importance_otu.select)
+otu.select <- otu[ ,c(otu_id.select, 'plant_age')]
+otu.select <- reshape2::melt(otu.select, id = 'plant_age')
+
+ggplot(otu.select, aes(x = plant_age, y = value)) +
+geom_point() +
+geom_smooth() +
+facet_wrap(~variable, ncol = 3, scale = 'free_y') +
+labs(title = '',x = 'Plant age (days)', y = 'Relative abundance')
+
+##只包??? 10 个重要预测变量的简约回???
+otu.select <- otu[ ,c(otu_id.select, 'plant_age')]
+
+library(ROCR)
+#为了方便后续评估随机森林模型的性能，将总数据集分为训练集（??? 70%）和测试集（??? 30%???
+set.seed(123)
+train <- sample(nrow(otu.select), nrow(otu.select)*0.7)
+otu_train.select <- otu.select[train, ]
+otu_test.select <- otu.select[-train, ]
+
+#随机森林计算（默认生??? 500 棵决策树），详情 ?randomForest
+set.seed(123)
+otu_train.select.forest <- randomForest(plant_age~., data = otu_train.select, importance = TRUE)
+otu_train.select.forest
+
+#使用训练集，查看预测精度
+plant_predict <- predict(otu_train.select.forest, otu_train.select)
+plot(otu_train.select$plant_age, plant_predict, main = '训练???',  
+    xlab = 'Plant age (days)', ylab = 'Predict')
+abline(1, 1)
+
+#使用测试集，评估预测性能
+plant_predict <- predict(otu_train.select.forest, otu_test.select)
+
+plot(otu_test.select$plant_age, plant_predict, main = '测试???',
+    xlab = 'Plant age (days)', ylab = 'Predict')
+abline(1, 1)
+
+相关性热图绘制
+# Load necessary libraries
+library(psych)
+library(reshape2)
+library(ggplot2)
+library(grid)
+library(pheatmap)
+library(dendextend)
+
+# Set working directory
+setwd("C:/Users/Anton/Desktop/220205-使用ggplot2绘制相关性气泡图和相关性热图的一个例子")
+
+# Read in taxonomic data
+taxonomy <- read.delim('tax.txt', row.names = 1, sep = '\t', stringsAsFactors = FALSE, check.names = FALSE)
+
+# Read in environmental data with header
+env <- read.delim('env.txt', sep = '\t', header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+
+# Ensure the row names of 'env' match the row names of 'taxonomy'
+rownames(env) <- env$sample
+env <- env[, -1]
+
+# Convert all columns in env to numeric (if they are not already)
+env[] <- lapply(env, function(x) as.numeric(as.character(x)))
+
+# Compute the Spearman correlation coefficients
+corr_matrix <- corr.test(taxonomy, env, method = 'spearman', adjust = 'BH')
+r <- corr_matrix$r    # Correlation matrix
+p <- corr_matrix$p    # p-value matrix
+
+# Select significant correlation coefficients (p < 0.05)
+significant <- which(p < 0.05, arr.ind = TRUE)
+
+# Extract significant correlations
+taxonomy_sig <- rownames(r)[significant[, 1]]
+env_sig_indices <- significant[, 2]
+env_sig <- colnames(r)[env_sig_indices]
+r_sig <- r[significant]
+p_sig <- p[significant]
+
+# Ensure all vectors have the same length
+if (length(taxonomy_sig) == length(env_sig) && length(taxonomy_sig) == length(r_sig) && length(taxonomy_sig) == length(p_sig)) {
+  results <- data.frame(
+    taxonomy = taxonomy_sig,
+    env = env_sig,
+    r = r_sig,
+    p = p_sig
+  )
+} else {
+  stop("Length of significant correlation vectors are not equal.")
+}
+
+# Select the top 30 correlations with the highest absolute r values
+results <- results[order(abs(results$r), decreasing = TRUE), ]
+top_results <- head(results, 30)
+
+# Convert to long format for pheatmap
+top_results$taxonomy <- factor(top_results$taxonomy, levels = unique(top_results$taxonomy))
+
+# Create a matrix for the heatmap
+heatmap_matrix <- matrix(0, nrow = length(unique(top_results$taxonomy)), ncol = length(env))
+rownames(heatmap_matrix) <- unique(top_results$taxonomy)
+colnames(heatmap_matrix) <- colnames(env)
+
+# Fill in the heatmap matrix
+for (i in 1:nrow(top_results)) {
+  heatmap_matrix[as.character(top_results$taxonomy[i]), as.character(top_results$env[i])] <- top_results$r[i]
+}
+
+# Create annotations for significant correlations
+annotation_matrix <- matrix("", nrow = nrow(heatmap_matrix), ncol = ncol(heatmap_matrix))
+rownames(annotation_matrix) <- rownames(heatmap_matrix)
+colnames(annotation_matrix) <- colnames(heatmap_matrix)
+
+for (i in 1:nrow(top_results)) {
+  if (!is.na(top_results$p[i])) {
+    annotation_matrix[as.character(top_results$taxonomy[i]), as.character(top_results$env[i])] <- ifelse(top_results$r[i] > 0, "+", "-")
+  }
+}
+
+# Define the new color palette
+my_colors <- colorRampPalette(c("#00bfc4", "#ffffff", "#ea5b57"))(100)
+
+# Plot the heatmap using pheatmap
+pheatmap(
+  heatmap_matrix,
+  color = my_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  display_numbers = annotation_matrix,
+  fontsize = 10,
+  fontsize_number = 8,
+  number_color = "white",
+  legend = TRUE,
+  annotation_legend = TRUE,
+  main = "Top 30 Significant Spearman Correlations",
+  angle_col = 45
+)
+
+蝴蝶图绘制
+getwd()
+setwd("C:/Users/Anton/Desktop/新建文件夹/R语言/蝴蝶图绘制")
+
+#读取数据
+up <- read.delim('GO.MF.up.txt', sep = '\t', stringsAsFactors = FALSE)
+down <- read.delim('GO.MF.down.txt', sep = '\t', stringsAsFactors = FALSE)
+
+#按 p 值排序，同时当两数据不等长时补充空白数据（尽可能使蝴蝶图对称）
+up <- up[order(up$P_Value, decreasing = TRUE), ]
+up$Term <- factor(up$Term, levels = up$Term)
+id_up <- levels(up$Term)
+down <- down[order(down$P_Value, decreasing = TRUE), ]
+down$Term <- factor(down$Term, levels = down$Term)
+id_down <- levels(down$Term)
+
+n <- length(up$Term) - length(down$Term)
+if (n > 0) {
+  down$Term <- as.character(down$Term)
+  for (i in paste('nn', as.character(seq(1, n, 1)), sep = '')) down <- rbind(list(i, NA, NA), down)
+  down$Term <- factor(down$Term, levels = down$Term)
+  id_down <- c(rep('', n), id_down)
+} else if (n < 0) {
+  up$Term <- as.character(up$Term)
+  for (i in paste('nn', as.character(seq(1, abs(n), 1)), sep = '')) up <- rbind(list(i, NA, NA), up)
+  up$Term <- factor(up$Term, levels = up$Term)
+  id_up <- c(rep('', abs(n)), id_up)
+}
+
+##ggplot2 作图
+library(ggplot2)
+
+#上调 GO
+p_up <- ggplot(up, aes(Term, log(P_Value, 10))) +
+  geom_col(fill = "#ea5b57", color = "black", width = 0.8) +
+  theme(panel.grid = element_blank(), panel.background = element_rect(fill = 'transparent')) +
+  theme(axis.line.x = element_line(colour = 'black'), axis.line.y = element_line(colour = 'transparent'), axis.ticks.y = element_line(colour = 'transparent')) +
+  theme(axis.text.y = element_text(size = 15))+
+  theme(plot.title = element_text(hjust = 0.5, face = 'plain',size = 25)) +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  labs(x = '', y = '', title = 'DLY') +
+  scale_y_continuous(expand = c(0, 0), breaks = c(-16, -12, -8, -4, 0), labels = as.character(abs(c(-16, -12, -8, -4, 0)))) +     #这儿更改间距设置
+  scale_x_discrete(labels = id_up)
+
+
+#下调 GO
+p_down <- ggplot(down, aes(Term, -log(P_Value, 10))) +
+  geom_col(fill = "#00bfc4", color = "black", width = 0.8) +
+  theme(panel.grid = element_blank(), panel.background = element_rect(fill = 'transparent')) +
+  theme(axis.line.x = element_line(colour = 'black'), axis.line.y = element_line(colour = 'transparent'), axis.ticks.y = element_line(colour = 'transparent')) +
+  theme(axis.text.y = element_text(size = 15))+
+  theme(plot.title = element_text(hjust = 0.5, face = 'plain', size = 25)) +
+  geom_hline(yintercept = 0) +
+  coord_flip() +
+  labs(x = '', y = '', title = 'NXP') +
+  scale_y_continuous(expand = c(0, 0), breaks = c(0, 4, 8, 12, 16), labels = as.character(c(0, 4, 8, 12, 16))) +       #这儿更改间距设置
+  scale_x_discrete(labels = id_down, position = 'top')
+
+#合并输出pdf
+library(cowplot)
+
+pdf('butterfly.pdf', width =14, height = 6)
+plot_grid(p_up, p_down, nrow = 2, ncol = 2, rel_heights = c(9,1), labels = 'KEGG_Enrichment Score (-log10(p-value))', label_x = 0.5, label_y = 0, label_fontface = 'plain')
+dev.off()
+
+
+
